@@ -1,0 +1,2000 @@
+// ============================================================
+// Knot & Thread Tales — Application Logic
+// Google Drive image support · No Cloudinary dependency
+// ============================================================
+
+'use strict';
+
+// ─── Theme (applies CONFIG.theme onto the CSS token vars in styles.css) ─
+function applyTheme() {
+  const t = CONFIG.theme;
+  if (!t) return;
+  const root = document.documentElement.style;
+  const map = {
+    '--c-primary':    t.colors?.primary,
+    '--c-primary-d':  t.colors?.primaryDark,
+    '--c-primary-l':  t.colors?.primaryLight,
+    '--c-secondary':  t.colors?.secondary,
+    '--c-accent':     t.colors?.accent,
+    '--c-bg':         t.colors?.bg,
+    '--c-surface':    t.colors?.surface,
+    '--c-text':       t.colors?.text,
+    '--c-text-2':     t.colors?.text2,
+    '--c-text-3':     t.colors?.text3,
+    '--c-success':    t.colors?.success,
+    '--c-error':      t.colors?.error,
+    '--c-border':     t.colors?.border,
+    '--c-border-d':   t.colors?.borderDark,
+    '--r-sm':         t.radius?.sm,
+    '--r-md':         t.radius?.md,
+    '--r-lg':         t.radius?.lg,
+    '--r-xl':         t.radius?.xl,
+    '--r-full':       t.radius?.full,
+    '--sh-sm':        t.shadow?.sm,
+    '--sh-md':        t.shadow?.md,
+    '--sh-lg':        t.shadow?.lg,
+    '--sh-xl':        t.shadow?.xl,
+    '--t-fast':       t.transition?.fast,
+    '--t-mid':        t.transition?.mid,
+    '--t-slow':       t.transition?.slow,
+    '--font-display': t.font?.display,
+    '--font-body':    t.font?.body,
+    '--max-w':        t.layout?.maxWidth,
+  };
+  Object.entries(map).forEach(([k, v]) => { if (v) root.setProperty(k, v); });
+}
+applyTheme();
+
+// ─── Cache Layer ──────────────────────────────────────────────
+const cache = (() => {
+  const store = new Map();
+  return {
+    get(key) {
+      const item = store.get(key);
+      if (!item) return null;
+      if (Date.now() > item.expires) { store.delete(key); return null; }
+      return item.value;
+    },
+    set(key, value) {
+      store.set(key, { value, expires: Date.now() + CONFIG.cache.ttlMs });
+    },
+    clear() { store.clear(); },
+  };
+})();
+
+// ─── Image Handler (Supabase Storage — single source of truth) ─
+const PLACEHOLDER_IMG = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 400'%3E%3Crect fill='%23f0e6d9' width='400' height='400'/%3E%3Ctext x='50%25' y='50%25' font-size='56' text-anchor='middle' dominant-baseline='middle'%3E%F0%9F%A7%B5%3C/text%3E%3C/svg%3E`;
+
+function imgUrl(url) {
+  return (url && url.startsWith('http')) ? url : PLACEHOLDER_IMG;
+}
+
+function driveImg(url) { return imgUrl(url); }
+function driveThumb(url) { return imgUrl(url); }
+
+function handleImgFallback(img) {
+  img.onerror = null;
+  img.src = PLACEHOLDER_IMG;
+}
+window.handleImgFallback = handleImgFallback;
+
+function imgAttrs(url) {
+  return `onerror="handleImgFallback(this)"`;
+}
+
+// ─── Supabase REST Client ─────────────────────────────────────
+const db = (() => {
+  const base = CONFIG.supabase.url + '/rest/v1';
+  const headers = {
+    'apikey': CONFIG.supabase.anonKey,
+    'Authorization': `Bearer ${CONFIG.supabase.anonKey}`,
+    'Content-Type': 'application/json',
+  };
+
+  async function query(table, params = {}) {
+    const url = new URL(`${base}/${table}`);
+    if (params.select) url.searchParams.set('select', params.select);
+    if (params.filter) {
+      Object.entries(params.filter).forEach(([k, v]) => url.searchParams.set(k, v));
+    }
+    if (params.or) url.searchParams.set('or', `(${params.or})`);
+    if (params.order) url.searchParams.set('order', params.order);
+    // FIX: _limit/_offset default to null (not undefined) in the query
+    // builder below. The old `!== undefined` check let a literal "null"
+    // string leak into the querystring whenever .limit()/.range() wasn't
+    // called, which PostgREST rejects as an invalid integer — silently
+    // caught by every caller's try/catch, so pages (e.g. the full FAQ
+    // list, categories nav) rendered empty with no visible error.
+    if (params.limit != null) url.searchParams.set('limit', params.limit);
+    if (params.offset != null) url.searchParams.set('offset', params.offset);
+
+    const cacheKey = url.toString();
+    const cached = cache.get(cacheKey);
+    if (cached) return cached;
+
+    const res = await fetch(url.toString(), { headers });
+    if (!res.ok) throw new Error(`DB ${res.status} on ${table}`);
+    const data = await res.json();
+    cache.set(cacheKey, data);
+    return data;
+  }
+
+  function makeQuery(table) {
+    const q = {
+      _table: table, _select: '*', _filter: {}, _or: null,
+      _order: null, _limit: null, _offset: null,
+
+      select(cols) { this._select = cols; return this; },
+      eq(col, val) { this._filter[col] = `eq.${val}`; return this; },
+      neq(col, val) { this._filter[col] = `neq.${val}`; return this; },
+      ilike(col, val) { this._filter[col] = `ilike.${val}`; return this; },
+      gte(col, val) { this._filter[col] = `gte.${val}`; return this; },
+      lte(col, val) { this._filter[col] = `lte.${val}`; return this; },
+      in(col, vals) { this._filter[col] = `in.(${vals.join(',')})`; return this; },
+      or(expr) { this._or = expr; return this; },
+      order(col, { ascending = true } = {}) {
+        const clause = `${col}.${ascending ? 'asc' : 'desc'}`;
+        this._order = this._order ? `${this._order},${clause}` : clause;
+        return this;
+      },
+      limit(n) { this._limit = n; return this; },
+      range(from, to) { this._offset = from; this._limit = to - from + 1; return this; },
+      execute() {
+        return query(this._table, {
+          select: this._select,
+          filter: this._filter,
+          or: this._or,
+          order: this._order,
+          limit: this._limit,
+          offset: this._offset,
+        });
+      },
+    };
+    return q;
+  }
+
+  async function insertRow(table, payload) {
+    const res = await fetch(`${base}/${table}`, {
+      method: 'POST',
+      headers: { ...headers, Prefer: 'return=representation' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`DB insert ${res.status} on ${table}: ${body}`);
+    }
+    cache.clear();
+    const data = await res.json().catch(() => []);
+    return Array.isArray(data) ? data[0] : data;
+  }
+
+  return {
+    from: (t) => ({
+      select: (c = '*') => makeQuery(t).select(c),
+      insert: (payload) => insertRow(t, payload),
+    }),
+  };
+})();
+
+// ─── Shared Product Images Fetcher ────────────────────────────
+async function fetchProductImages(productIds) {
+  const ids = Array.isArray(productIds) ? productIds : [productIds];
+  if (!ids.length) return [];
+  try {
+    const idList = ids.join(',');
+    const response = await fetch(
+      `${CONFIG.supabase.url}/rest/v1/product_images?product_id=in.(${idList})&order=sort_order.asc`,
+      {
+        headers: {
+          apikey: CONFIG.supabase.anonKey,
+          Authorization: `Bearer ${CONFIG.supabase.anonKey}`
+        }
+      }
+    );
+    if (!response.ok) return [];
+    return await response.json();
+  } catch { return []; }
+}
+
+// ─── Image Attachment Helper ──────────────────────────────────
+async function attachImages(products) {
+  if (!products?.length) return products;
+  const ids = products.map(p => p.id);
+  const allImages = await fetchProductImages(ids);
+
+  const byProduct = new Map();
+  allImages.forEach(img => {
+    if (!byProduct.has(img.product_id)) byProduct.set(img.product_id, []);
+    byProduct.get(img.product_id).push(img);
+  });
+
+  products.forEach(p => {
+    const imgs = (byProduct.get(p.id) || []).slice().sort((a, b) => {
+      if (a.is_primary && !b.is_primary) return -1;
+      if (!a.is_primary && b.is_primary) return 1;
+      return (a.sort_order || 0) - (b.sort_order || 0);
+    });
+    p.images = imgs;
+    p.main_image = imgs[0]?.image_url || null;
+  });
+  return products;
+}
+
+const Router = (() => {
+  const routes = new Map();
+  let _current = null;
+
+  function getPath() { return location.hash.slice(1) || '/'; }
+  function navigate(path) { location.hash = path; }
+  function on(path, handler) { routes.set(path, handler); }
+
+  function dispatch() {
+    const raw = getPath();
+    const [path, queryStr] = raw.split('?');
+    const params = new URLSearchParams(queryStr || '');
+    _current = path;
+
+    if (routes.has(path)) { routes.get(path)(params); return; }
+
+    for (const [pattern, handler] of routes) {
+      const regex = new RegExp('^' + pattern.replace(/:([^/]+)/g, '([^/]+)') + '$');
+      const m = path.match(regex);
+      if (m) {
+        const keys = [...pattern.matchAll(/:([^/]+)/g)].map(x => x[1]);
+        keys.forEach((k, i) => params.set(k, m[i + 1]));
+        handler(params); return;
+      }
+    }
+    navigate('/');
+  }
+
+  window.addEventListener('hashchange', dispatch);
+  return { on, navigate, dispatch, current: () => _current };
+})();
+
+// ─── State ────────────────────────────────────────────────────
+const State = {
+  categories: [],
+  businessSettings: null,
+  paymentSettings: null,
+  currentProduct: null,
+  searchQuery: '',
+  filterCategory: null,
+  filterPriceMin: null,
+  filterPriceMax: null,
+  filterInStock: false,
+  filterBestseller: false,
+  filterCustomizable: false,
+  sortBy: 'created_at',
+  sortAsc: false,
+  page: 0,
+};
+
+// ─── Utils ────────────────────────────────────────────────────
+const $ = (sel, ctx = document) => ctx.querySelector(sel);
+const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
+const esc = (str) => String(str ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const formatPrice = (p) => `${CONFIG.business.currency}${Number(p).toLocaleString('en-IN')}`;
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+
+function showToast(msg, type = 'success') {
+  const t = document.createElement('div');
+  t.className = `toast toast--${type}`;
+  t.innerHTML = `<span>${msg}</span>`;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('toast--show'));
+  setTimeout(() => { t.classList.remove('toast--show'); setTimeout(() => t.remove(), 400); }, 3500);
+}
+
+function skeleton(n = 1, cls = 'skeleton-card') {
+  return Array(n).fill(`<div class="${cls}"><div class="skeleton-img skeleton-shimmer"></div><div class="skeleton-line skeleton-shimmer"></div><div class="skeleton-line skeleton-shimmer" style="width:65%"></div></div>`).join('');
+}
+
+// ─── Scroll Reveal ────────────────────────────────────────────
+const revealObserver = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) { e.target.classList.add('revealed'); revealObserver.unobserve(e.target); }
+  });
+}, { threshold: 0.1 });
+
+function observeReveal(el) { el.classList.add('will-reveal'); revealObserver.observe(el); }
+
+// ─── Confetti ────────────────────────────────────────────────
+function fireConfetti() {
+  const colors = ['#A66E4A','#D8B89C','#E6C9A8','#4CAF50','#f59e0b','#ec4899','#a78bfa'];
+  for (let i = 0; i < 80; i++) {
+    const c = document.createElement('div');
+    c.className = 'confetti-piece';
+    c.style.cssText = `left:${Math.random()*100}vw;background:${colors[Math.floor(Math.random()*colors.length)]};animation-delay:${Math.random()*0.8}s;animation-duration:${1.2+Math.random()*1}s;width:${6+Math.random()*6}px;height:${6+Math.random()*6}px;border-radius:${Math.random()>0.5?'50%':'2px'}`;
+    document.body.appendChild(c);
+    setTimeout(() => c.remove(), 3000);
+  }
+}
+
+// ─── Floating WhatsApp Button ─────────────────────────────────
+function initFloatingWhatsApp() {
+  const btn = document.createElement('a');
+  btn.href = `https://wa.me/${CONFIG.whatsapp.number}?text=${encodeURIComponent('Hello! I visited your website and would like to know more about your handmade products 🧶')}`;
+  btn.target = '_blank';
+  btn.rel = 'noopener noreferrer';
+  btn.className = 'fab-whatsapp';
+  btn.setAttribute('aria-label', 'Chat on WhatsApp');
+  btn.innerHTML = `
+    <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893A11.821 11.821 0 0020.893 3.488"/></svg>
+    <span class="fab-whatsapp__pulse"></span>`;
+  document.body.appendChild(btn);
+
+  setTimeout(() => {
+    const tip = document.createElement('div');
+    tip.className = 'fab-tooltip';
+    tip.textContent = 'Chat with us! 💬';
+    document.body.appendChild(tip);
+    setTimeout(() => tip.remove(), 4000);
+  }, 4000);
+}
+
+// ─── Offer Countdown Timer ────────────────────────────────────
+// Genuine countdown: reads the earliest active discount announcement's
+// ends_at from Supabase. Shows nothing at all if no real offer is
+// currently running — no fabricated "today only" timer that never expires.
+async function initCountdown() {
+  const wrap = document.querySelector('.hero__offer');
+  const el = document.getElementById('offerCountdown');
+  if (!el || !wrap) return;
+  wrap.style.display = 'none';
+
+  let offer;
+  try {
+    const rows = await db.from('announcements')
+      .select('message,ends_at')
+      .eq('type', 'discount')
+      .eq('is_active', true)
+      .order('ends_at', { ascending: true })
+      .limit(5)
+      .execute();
+    const now = Date.now();
+    offer = (rows || []).find(r => r.ends_at && new Date(r.ends_at).getTime() > now);
+  } catch (err) {
+    console.error('Countdown fetch failed:', err);
+    return;
+  }
+  if (!offer) return; // no real active offer — leave the block hidden
+
+  const labelEl = wrap.querySelector('.hero__offer-label');
+  if (labelEl && offer.message) labelEl.textContent = `🔥 ${offer.message}`;
+  const end = new Date(offer.ends_at).getTime();
+
+  function tick() {
+    const diff = end - Date.now();
+    if (diff <= 0) { wrap.style.display = 'none'; clearInterval(timer); return; }
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    const s = Math.floor((diff % 60000) / 1000);
+    el.innerHTML = `<span>${String(h).padStart(2,'0')}</span>:<span>${String(m).padStart(2,'0')}</span>:<span>${String(s).padStart(2,'0')}</span>`;
+  }
+  wrap.style.display = '';
+  tick();
+  const timer = setInterval(tick, 1000);
+}
+
+// ─── Recent Activity Ticker ────────────────────────────────────
+// Genuine social proof: pulls the most recent admin-approved reviews
+// (real customers, real orders, moderated before going live) instead of
+// a hardcoded list of invented names. Hides itself if there's nothing
+// real to show yet — a quiet storefront beats a fake-looking one.
+async function initBuyTicker() {
+  const wrap = document.querySelector('.hero-announce');
+  const el = document.getElementById('buyTicker');
+  if (!el || !wrap) return;
+  wrap.style.display = 'none';
+
+  let items = [];
+  try {
+    const reviews = await db.from('reviews')
+      .select('customer_name,product_id,created_at')
+      .eq('approved', true)
+      .order('created_at', { ascending: false })
+      .limit(15)
+      .execute();
+    const ids = [...new Set((reviews || []).map(r => r.product_id).filter(Boolean))];
+    let products = [];
+    if (ids.length) {
+      products = await db.from('products').select('id,name').in('id', ids).execute();
+    }
+    const nameById = new Map((products || []).map(p => [p.id, p.name]));
+    items = (reviews || [])
+      .map(r => ({ name: r.customer_name, product: nameById.get(r.product_id) }))
+      .filter(r => r.name && r.product);
+  } catch (err) {
+    console.error('Buy ticker fetch failed:', err);
+    return;
+  }
+  if (!items.length) return; // no real reviews yet — stay hidden, don't fabricate
+
+  wrap.style.display = '';
+  let i = 0;
+  function show() {
+    el.classList.remove('ticker--in');
+    el.classList.add('ticker--out');
+    setTimeout(() => {
+      const it = items[i % items.length];
+      el.textContent = `⭐ ${it.name} loved their ${it.product}`;
+      el.classList.remove('ticker--out');
+      el.classList.add('ticker--in');
+      i++;
+    }, 400);
+  }
+  show();
+  if (items.length > 1) setInterval(show, 4500);
+}
+
+// ─── Image Slider / Gallery Component ─────────────────────────
+// Professional slider: swipe support, arrow nav, dot indicators,
+// thumbnail strip, click-to-zoom-at-point + pan, and a fullscreen
+// lightbox with its own nav. Used in the product modal.
+function buildGallery(images, container) {
+  if (!images?.length) {
+    container.innerHTML = `<div class="slider slider--empty"><img src="${driveImg('')}" alt="No image available" class="slider__img"></div>`;
+    return;
+  }
+  const urls = images.map(i => (typeof i === 'string' ? i : i.image_url || i.url || i));
+  let active = 0;
+  let zoomed = false;
+
+  container.innerHTML = `
+    <div class="slider" id="productSlider">
+      <div class="slider__viewport" id="sliderViewport">
+        <div class="slider__track" id="sliderTrack" style="transform:translateX(0%)">
+          ${urls.map((u, i) => `
+            <div class="slider__slide" data-idx="${i}">
+              <img src="${driveImg(u)}" alt="Product image ${i + 1}" class="slider__img"
+                   loading="${i === 0 ? 'eager' : 'lazy'}" decoding="async" ${imgAttrs(u, 800)}>
+            </div>`).join('')}
+        </div>
+        ${urls.length > 1 ? `
+        <button class="slider__arrow slider__arrow--prev" aria-label="Previous image">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <button class="slider__arrow slider__arrow--next" aria-label="Next image">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>` : ''}
+        <button class="slider__zoom-btn" aria-label="Zoom image" id="sliderZoomBtn">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+        </button>
+        <button class="slider__fullscreen-btn" aria-label="View fullscreen" id="sliderFullscreenBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        </button>
+        ${urls.length > 1 ? `<div class="slider__counter"><span id="sliderCounterText">1 / ${urls.length}</span></div>` : ''}
+      </div>
+      ${urls.length > 1 ? `
+      <div class="slider__dots" id="sliderDots">
+        ${urls.map((_, i) => `<button class="slider__dot${i===0?' active':''}" data-idx="${i}" aria-label="Go to image ${i+1}"></button>`).join('')}
+      </div>
+      <div class="slider__thumbs" id="sliderThumbs">
+        ${urls.map((u, i) => `
+          <button class="thumb-item${i===0?' active':''}" data-idx="${i}" aria-label="Image ${i+1}">
+            <img src="${driveThumb(u)}" alt="Thumb ${i+1}" loading="lazy" ${imgAttrs(u, 480)}>
+          </button>`).join('')}
+      </div>` : ''}
+    </div>`;
+
+  const track = container.querySelector('#sliderTrack');
+  const viewport = container.querySelector('#sliderViewport');
+  const counterText = container.querySelector('#sliderCounterText');
+  const dots = container.querySelectorAll('.slider__dot');
+  const thumbs = container.querySelectorAll('.thumb-item');
+  const slides = container.querySelectorAll('.slider__slide');
+
+  function goTo(idx, animate = true) {
+    active = (idx + urls.length) % urls.length;
+    track.style.transition = animate ? 'transform .4s cubic-bezier(.4,0,.2,1)' : 'none';
+    track.style.transform = `translateX(-${active * 100}%)`;
+    dots.forEach((d, i) => d.classList.toggle('active', i === active));
+    thumbs.forEach((t, i) => {
+      t.classList.toggle('active', i === active);
+      if (i === active) t.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    });
+    if (counterText) counterText.textContent = `${active + 1} / ${urls.length}`;
+    resetZoom();
+  }
+
+  function resetZoom() {
+    zoomed = false;
+    slides.forEach(s => { const img = s.querySelector('.slider__img'); if (img) { img.style.transformOrigin = ''; img.classList.remove('zoomed'); } });
+    viewport.classList.remove('is-zoomed');
+  }
+
+  container.querySelector('.slider__arrow--prev')?.addEventListener('click', () => goTo(active - 1));
+  container.querySelector('.slider__arrow--next')?.addEventListener('click', () => goTo(active + 1));
+  dots.forEach(d => d.addEventListener('click', () => goTo(Number(d.dataset.idx))));
+  thumbs.forEach(t => t.addEventListener('click', () => goTo(Number(t.dataset.idx))));
+
+  // ── Zoom (click-to-toggle at click point, mousemove pan, touch pan) ──
+  function getActiveImg() {
+    return slides[active]?.querySelector('.slider__img');
+  }
+
+  function setZoomOrigin(clientX, clientY) {
+    const img = getActiveImg();
+    const slideEl = slides[active];
+    if (!img || !slideEl) return;
+    const rect = slideEl.getBoundingClientRect();
+    const x = Math.min(100, Math.max(0, ((clientX - rect.left) / rect.width) * 100));
+    const y = Math.min(100, Math.max(0, ((clientY - rect.top) / rect.height) * 100));
+    img.style.transformOrigin = `${x}% ${y}%`;
+  }
+
+  function setZoom(on, clientX, clientY) {
+    const img = getActiveImg();
+    if (!img) return;
+    zoomed = on;
+    viewport.classList.toggle('is-zoomed', zoomed);
+    img.classList.toggle('zoomed', zoomed);
+    if (!zoomed) { img.style.transformOrigin = ''; return; }
+    if (typeof clientX === 'number') setZoomOrigin(clientX, clientY);
+    else img.style.transformOrigin = '50% 50%';
+  }
+
+  // Click directly on the image: zoom in centered on the click point,
+  // or zoom back out if already zoomed.
+  slides.forEach(slideEl => {
+    slideEl.addEventListener('click', (e) => {
+      if (zoomed) setZoom(false);
+      else setZoom(true, e.clientX, e.clientY);
+    });
+  });
+
+  // Pan while zoomed. Bound on the viewport (not the slide) so moving
+  // the cursor over the overlay buttons — which are siblings of the
+  // slide, not descendants — doesn't interrupt panning.
+  viewport.addEventListener('mousemove', (e) => {
+    if (zoomed) setZoomOrigin(e.clientX, e.clientY);
+  });
+
+  // Dedicated zoom button always zooms centered — it no longer uses
+  // its own on-screen position (which sat near the bottom-right of
+  // the image and made zoom look permanently "stuck" in that corner).
+  container.querySelector('#sliderZoomBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setZoom(!zoomed);
+  });
+
+  // ── Swipe support (touch) — also pans while zoomed ──
+  let touchStartX = 0, touchDeltaX = 0, isTouching = false;
+  viewport.addEventListener('touchstart', (e) => {
+    isTouching = true;
+    touchStartX = e.touches[0].clientX;
+    if (!zoomed) track.style.transition = 'none';
+  }, { passive: true });
+  viewport.addEventListener('touchmove', (e) => {
+    if (!isTouching) return;
+    const t = e.touches[0];
+    if (zoomed) { setZoomOrigin(t.clientX, t.clientY); return; }
+    touchDeltaX = t.clientX - touchStartX;
+    const pct = (touchDeltaX / viewport.clientWidth) * 100;
+    track.style.transform = `translateX(calc(-${active * 100}% + ${pct}%))`;
+  }, { passive: true });
+  viewport.addEventListener('touchend', () => {
+    if (!isTouching || zoomed) { isTouching = false; return; }
+    isTouching = false;
+    if (Math.abs(touchDeltaX) > viewport.clientWidth * 0.18) {
+      goTo(touchDeltaX < 0 ? active + 1 : active - 1);
+    } else {
+      goTo(active);
+    }
+    touchDeltaX = 0;
+  });
+
+  // ── Keyboard nav while gallery is focused/hovered ──
+  container.setAttribute('tabindex', '0');
+  container.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') goTo(active - 1);
+    if (e.key === 'ArrowRight') goTo(active + 1);
+  });
+
+  // ── Fullscreen lightbox ──
+  function openFullscreenAt(idx) {
+    const overlay = document.createElement('div');
+    overlay.className = 'fullscreen-overlay';
+    overlay.innerHTML = `
+      <button class="fullscreen-close" aria-label="Close">&times;</button>
+      ${urls.length > 1 ? `
+      <button class="fullscreen-nav fullscreen-prev" aria-label="Prev">&#8592;</button>
+      <button class="fullscreen-nav fullscreen-next" aria-label="Next">&#8594;</button>` : ''}
+      <div class="fullscreen-img-wrap" id="fsImgWrap">
+        <img src="${driveImg(urls[idx])}" alt="Fullscreen view" class="fullscreen-img" id="fsImg">
+      </div>
+      ${urls.length > 1 ? `<div class="fullscreen-counter">${idx + 1} / ${urls.length}</div>` : ''}`;
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add('active'));
+
+    let cur = idx, fsZoomed = false;
+    const counter = overlay.querySelector('.fullscreen-counter');
+    const img = overlay.querySelector('#fsImg');
+    const wrap = overlay.querySelector('#fsImgWrap');
+
+    function fsSetOrigin(clientX, clientY) {
+      const rect = wrap.getBoundingClientRect();
+      const x = Math.min(100, Math.max(0, ((clientX - rect.left) / rect.width) * 100));
+      const y = Math.min(100, Math.max(0, ((clientY - rect.top) / rect.height) * 100));
+      img.style.transformOrigin = `${x}% ${y}%`;
+    }
+    function fsGoTo(i) {
+      cur = (i + urls.length) % urls.length;
+      img.src = driveImg(urls[cur]);
+      if (counter) counter.textContent = `${cur + 1} / ${urls.length}`;
+      fsZoomed = false; img.classList.remove('zoomed'); img.style.transformOrigin = '';
+    }
+    function fsToggleZoom(e) {
+      fsZoomed = !fsZoomed;
+      img.classList.toggle('zoomed', fsZoomed);
+      if (!fsZoomed) { img.style.transformOrigin = ''; return; }
+      if (e?.clientX) fsSetOrigin(e.clientX, e.clientY);
+      else img.style.transformOrigin = '50% 50%';
+    }
+    wrap.addEventListener('click', (e) => { if (e.target === img) fsToggleZoom(e); });
+    wrap.addEventListener('mousemove', (e) => { if (fsZoomed) fsSetOrigin(e.clientX, e.clientY); });
+
+    function close() { overlay.classList.remove('active'); setTimeout(() => overlay.remove(), 280); document.removeEventListener('keydown', kh); goTo(cur, false); }
+    overlay.querySelector('.fullscreen-close').onclick = close;
+    overlay.querySelector('.fullscreen-prev')?.addEventListener('click', () => fsGoTo(cur - 1));
+    overlay.querySelector('.fullscreen-next')?.addEventListener('click', () => fsGoTo(cur + 1));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+    function kh(e) {
+      if (e.key === 'Escape') close();
+      if (e.key === 'ArrowLeft') fsGoTo(cur - 1);
+      if (e.key === 'ArrowRight') fsGoTo(cur + 1);
+    }
+    document.addEventListener('keydown', kh);
+
+    let fsStartX = 0, fsDeltaX = 0;
+    wrap.addEventListener('touchstart', (e) => { fsStartX = e.touches[0].clientX; }, { passive: true });
+    wrap.addEventListener('touchmove', (e) => { if (fsZoomed) fsSetOrigin(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+    wrap.addEventListener('touchend', (e) => {
+      if (fsZoomed) return;
+      fsDeltaX = e.changedTouches[0].clientX - fsStartX;
+      if (Math.abs(fsDeltaX) > 60) fsGoTo(fsDeltaX < 0 ? cur + 1 : cur - 1);
+    }, { passive: true });
+  }
+
+  container.querySelector('#sliderFullscreenBtn')?.addEventListener('click', (e) => { e.stopPropagation(); openFullscreenAt(active); });
+  window.openFullscreen = openFullscreenAt;
+
+  goTo(0, false);
+}
+
+// ─── Product Card ─────────────────────────────────────────────
+function productCard(p) {
+  const hasOffer = p.offer_price && Number(p.offer_price) < Number(p.price);
+  const discount = hasOffer ? Math.round((1 - p.offer_price / p.price) * 100) : 0;
+  const displayPrice = hasOffer ? p.offer_price : p.price;
+  const imgs = (p.images && p.images.length) ? p.images.map(i => i.image_url) : (p.main_image ? [p.main_image] : []);
+  const multi = imgs.length > 1;
+
+  return `
+    <article class="product-card" data-id="${p.id}" tabindex="0" role="button" aria-label="View ${esc(p.name)}">
+      <div class="product-card__img-wrap${multi ? ' has-multi' : ''}">
+        ${multi ? `
+        <div class="card-mini-slider" data-idx="0">
+          ${imgs.map((u, i) => `<img src="${driveThumb(u)}" alt="${esc(p.name)} photo ${i+1}" class="card-mini-slider__img${i===0?' active':''}" loading="lazy" decoding="async" data-idx="${i}" ${imgAttrs(u, 480)}>`).join('')}
+        </div>
+        <div class="card-mini-dots">
+          ${imgs.map((_, i) => `<span class="card-mini-dot${i===0?' active':''}"></span>`).join('')}
+        </div>
+        <span class="badge-image-count">📷 ${imgs.length}</span>` : `
+        <img src="${driveThumb(imgs[0] || '')}" alt="${esc(p.name)}" class="product-card__img" loading="lazy" decoding="async" ${imgAttrs(imgs[0] || '', 480)}>`}
+        <div class="product-card__badges">
+          <span class="badge badge--handmade">Handmade</span>
+          ${p.is_bestseller ? '<span class="badge badge--bestseller">⭐ Bestseller</span>' : ''}
+          ${p.is_customizable ? '<span class="badge badge--custom">✏️ Custom</span>' : ''}
+          ${hasOffer ? `<span class="badge badge--off">−${discount}%</span>` : ''}
+        </div>
+        ${!p.in_stock ? '<div class="product-card__oos">Out of Stock</div>' : ''}
+        <div class="product-card__shine"></div>
+        <div class="product-card__quick">
+          <button class="quick-view-btn" data-id="${p.id}" aria-label="Quick view">👁 Quick View</button>
+        </div>
+      </div>
+      <div class="product-card__body">
+        <p class="product-card__code">${esc(p.product_code || 'KTT-' + p.id)}</p>
+        <h3 class="product-card__name">${esc(p.name)}</h3>
+        <div class="product-card__pricing">
+          <span class="product-card__price">${formatPrice(displayPrice)}</span>
+          ${hasOffer ? `<span class="product-card__orig">${formatPrice(p.price)}</span>` : ''}
+        </div>
+        <button class="btn btn--primary btn--sm product-card__order ${!p.in_stock ? 'btn--disabled' : ''}"
+                data-id="${p.id}" ${!p.in_stock ? 'disabled aria-disabled="true"' : ''}>
+          💬 ${p.in_stock ? 'Order via WhatsApp' : 'Out of Stock'}
+        </button>
+      </div>
+    </article>`;
+}
+
+function initCardMiniSliders(scope = document) {
+  scope.querySelectorAll('.card-mini-slider').forEach(slider => {
+    const card = slider.closest('.product-card');
+    const imgs = slider.querySelectorAll('.card-mini-slider__img');
+    const dots = card.querySelectorAll('.card-mini-dot');
+    if (imgs.length < 2) return;
+    let idx = 0, timer = null;
+
+    function show(i) {
+      idx = i;
+      imgs.forEach((im, k) => im.classList.toggle('active', k === idx));
+      dots.forEach((d, k) => d.classList.toggle('active', k === idx));
+    }
+    card.addEventListener('mouseenter', () => {
+      timer = setInterval(() => show((idx + 1) % imgs.length), 900);
+    });
+    card.addEventListener('mouseleave', () => {
+      clearInterval(timer);
+      show(0);
+    });
+  });
+}
+
+// ─── WhatsApp Order Modal ─────────────────────────────────────
+function openOrderModal(product) {
+  State.currentProduct = product;
+  const m = document.getElementById('orderModal');
+  if (!m) return;
+  m.querySelector('.order-product-name').textContent = product.name;
+  m.querySelector('.order-product-code').textContent = product.product_code || 'KTT-' + product.id;
+  m.querySelector('.order-product-price').textContent = formatPrice(product.offer_price || product.price);
+  m.querySelector('#orderForm').reset();
+  openModal('orderModal');
+}
+
+async function submitOrder(e) {
+  e.preventDefault();
+  const form = e.target;
+  const p = State.currentProduct;
+  if (!p) return;
+
+  const name    = form.customerName.value.trim();
+  const phone   = form.customerPhone.value.trim();
+  const address = form.customerAddress.value.trim();
+  const pincode = form.customerPincode.value.trim();
+  const qty     = form.customerQty.value.trim();
+  const notes   = form.customizationNotes.value.trim();
+  const unitPrice = Number(p.offer_price || p.price);
+  const display = formatPrice(unitPrice);
+
+  closeModal('orderModal');
+  fireConfetti();
+  showToast('Order sent! Opening WhatsApp… 🎉');
+
+  // Insert first so we have a real DB id to build a matchable order
+  // reference from. If the insert fails (offline, RLS, etc.) fall back to a
+  // timestamp-based reference so the flow never breaks — it just won't be
+  // matchable to an admin row.
+  let orderRef;
+  try {
+    const inserted = await db.from('orders').insert({
+      product_id: p.id,
+      product_code: p.product_code || null,
+      product_name: p.name,
+      unit_price: unitPrice,
+      quantity: Number(qty) || 1,
+      customer_name: name,
+      customer_phone: phone,
+      customer_address: address,
+      customer_pincode: pincode,
+      customization_notes: notes || null,
+      status: 'pending',
+    });
+    orderRef = `KTT-${String(inserted?.id ?? '').padStart(4, '0')}`;
+  } catch (err) {
+    // Order still proceeds via WhatsApp even if logging fails, but log the
+    // real reason so it's visible in devtools instead of silently vanishing.
+    console.error('Order insert failed:', err);
+    orderRef = `KTT-${Date.now().toString(36).toUpperCase()}`;
+  }
+  State.lastOrderRef = orderRef;
+
+  const msg = encodeURIComponent(
+`Hello Knot & Thread Tales! 🌸
+
+I would like to place an order.
+
+*Order Reference:* ${orderRef}
+
+*Product Details:*
+Product Code: ${p.product_code || 'KTT-' + p.id}
+Product Name: ${p.name}
+Price: ${display}
+
+*Customer Details:*
+Name: ${name}
+Phone: ${phone}
+Address: ${address}
+Pincode: ${pincode}
+Quantity: ${qty}
+
+*Customization:*
+${notes || 'None'}
+
+Please confirm availability and payment instructions. 🙏`
+  );
+
+  setTimeout(() => {
+    openPaymentModal();
+    window.open(`https://wa.me/${CONFIG.whatsapp.number}?text=${msg}`, '_blank');
+  }, 700);
+}
+
+// ─── Payment Modal ────────────────────────────────────────────
+async function openPaymentModal() {
+  let ps = State.paymentSettings;
+  if (!ps) {
+    try {
+      const data = await db.from('payment_settings').select('*').limit(1).execute();
+      ps = data[0] || { upi_id: CONFIG.upi.id, merchant_name: CONFIG.upi.name, qr_image: null };
+      State.paymentSettings = ps;
+    } catch {
+      ps = { upi_id: CONFIG.upi.id, merchant_name: CONFIG.upi.name, qr_image: null };
+    }
+  }
+
+  const m = document.getElementById('paymentModal');
+  if (!m) return;
+  const refEl = m.querySelector('.payment-order-ref');
+  if (refEl) refEl.textContent = State.lastOrderRef || '';
+  m.querySelector('.payment-upi-id').textContent = ps.upi_id;
+  m.querySelector('.payment-merchant').textContent = ps.merchant_name;
+  const qrImg = m.querySelector('.payment-qr');
+  const upiNote = encodeURIComponent(State.lastOrderRef || 'KTT order');
+  if (qrImg) {
+    if (ps.qr_image) {
+      qrImg.dataset.raw = ps.qr_image;
+      qrImg.dataset.size = '800';
+      qrImg.dataset.fbstep = '0';
+      qrImg.onerror = () => handleImgFallback(qrImg);
+      qrImg.src = driveImg(ps.qr_image);
+    } else {
+      qrImg.onerror = null;
+      qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=upi://pay?pa=${encodeURIComponent(ps.upi_id)}&pn=${encodeURIComponent(ps.merchant_name)}&tn=${upiNote}`;
+    }
+  }
+  openModal('paymentModal');
+}
+
+function copyUPI() {
+  const upi = document.querySelector('.payment-upi-id')?.textContent;
+  if (!upi) return;
+  navigator.clipboard.writeText(upi)
+    .then(() => showToast('✅ UPI ID copied!'))
+    .catch(() => showToast('UPI: ' + upi));
+}
+
+// Turns the previously decorative "Transaction Reference" field into a real
+// confirmation step: it sends the UTR straight back to WhatsApp tagged with
+// the same order reference shown above, so it lands in the same thread as
+// the original order and is easy to match to the pending row in admin.
+function confirmPayment() {
+  const utr = document.getElementById('txnRef')?.value.trim();
+  const ref = State.lastOrderRef || 'unknown';
+  const msg = encodeURIComponent(
+    `Payment done ✅\n\nOrder Reference: ${ref}\nUTR / Transaction Reference: ${utr || 'Not provided — screenshot attached'}\n\nSharing my payment confirmation for this order.`
+  );
+  window.open(`https://wa.me/${CONFIG.whatsapp.number}?text=${msg}`, '_blank');
+  closeModal('paymentModal');
+}
+
+function downloadQR() {
+  const img = document.querySelector('.payment-qr');
+  if (!img) return;
+  const a = document.createElement('a');
+  a.href = img.src; a.download = 'ktt-upi-qr.png'; a.click();
+}
+
+function shareQR() {
+  if (navigator.share) {
+    navigator.share({ title: 'Pay Knot & Thread Tales', text: `UPI: ${State.paymentSettings?.upi_id}`, url: location.href }).catch(() => {});
+  } else { copyUPI(); }
+}
+
+// ─── Modal System ─────────────────────────────────────────────
+function openModal(id) {
+  const m = document.getElementById(id);
+  if (!m) return;
+  m.setAttribute('aria-hidden', 'false');
+  m.classList.add('modal--open');
+  document.body.style.overflow = 'hidden';
+  setTimeout(() => m.querySelector('.modal-close')?.focus(), 100);
+}
+
+function closeModal(id) {
+  const m = document.getElementById(id);
+  if (!m) return;
+  m.setAttribute('aria-hidden', 'true');
+  m.classList.remove('modal--open');
+  if (!$$('.modal--open').length) document.body.style.overflow = '';
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') $$('.modal--open').forEach(m => closeModal(m.id));
+});
+
+// ─── Announcements Bar ─────────────────────────────────────────
+async function renderAnnouncementBar() {
+  const bar = document.getElementById('announcementBar');
+  if (!bar) return;
+  try {
+    const items = await db.from('announcements').select('*').eq('is_active', true).order('sort_order').order('id').execute();
+    const now = new Date();
+    const live = items.filter(a => {
+      if (a.starts_at && new Date(a.starts_at) > now) return false;
+      if (a.ends_at && new Date(a.ends_at) < now) return false;
+      const dismissed = sessionStorage.getItem(`ktt_ann_dismissed_${a.id}`);
+      return !dismissed;
+    });
+    if (!live.length) { bar.hidden = true; bar.innerHTML = ''; return; }
+
+    bar.hidden = false;
+    bar.innerHTML = live.map(a => `
+      <div class="announce-bar__item announce-bar__item--${esc(a.type || 'info')}" data-id="${a.id}">
+        <span class="announce-bar__text">${a.emoji ? esc(a.emoji) + ' ' : ''}${esc(a.message)}</span>
+        ${a.link_url ? `<a href="${esc(a.link_url)}" class="announce-bar__link">${esc(a.link_text || 'Shop now')} →</a>` : ''}
+        <button class="announce-bar__close" aria-label="Dismiss announcement" data-id="${a.id}">&times;</button>
+      </div>`).join('');
+
+    bar.querySelectorAll('.announce-bar__close').forEach(btn => {
+      btn.addEventListener('click', () => {
+        sessionStorage.setItem(`ktt_ann_dismissed_${btn.dataset.id}`, '1');
+        btn.closest('.announce-bar__item')?.remove();
+        if (!bar.querySelector('.announce-bar__item')) bar.hidden = true;
+      });
+    });
+  } catch { bar.hidden = true; }
+}
+
+// ─── App Init ─────────────────────────────────────────────────
+async function initApp() {
+  try {
+    State.categories = await db.from('categories').select('id,name,slug,icon,sort_order').order('sort_order').execute();
+  } catch { State.categories = []; }
+
+  try {
+    const bs = await db.from('business_settings').select('*').limit(1).execute();
+    State.businessSettings = bs[0] || null;
+  } catch { State.businessSettings = null; }
+
+  renderNav();
+  renderAnnouncementBar();
+  loadTrustStats();
+
+  Router.on('/', renderHome);
+  Router.on('/products', renderProductsPage);
+  Router.on('/search', renderSearchPage);
+  Router.on('/about', renderAboutPage);
+  Router.on('/faq', renderFaqPage);
+  Router.on('/contact', renderContactPage);
+  Router.on('/reviews', renderReviewsPage);
+  Router.on('/privacy', renderPrivacyPage);
+  Router.on('/terms', renderTermsPage);
+  Router.on('/category/:slug', renderCategoryPage);
+  // Deep link for a single product — renders the products page as a
+  // backdrop, then opens that product's modal on top. This is what makes
+  // a product shareable via a real URL (Meta catalog, Pinterest, a direct
+  // WhatsApp link) instead of only being reachable by clicking a card.
+  Router.on('/product/:id', (params) => { renderProductsPage(); openProductModal(params.get('id')); });
+
+  Router.dispatch();
+
+  document.addEventListener('click', globalClickHandler);
+
+  initMobileMenu();
+  initSearchBar();
+  initScrollHeader();
+  initFloatingWhatsApp();
+  initBuyTicker();
+  initProductFilters();
+  initInstallPrompt();
+}
+
+function initInstallPrompt() {
+  let deferredPrompt = null;
+  const btn = document.getElementById('installAppBtn');
+  const divider = document.getElementById('installDivider');
+  if (!btn) return;
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    btn.hidden = false;
+    if (divider) divider.hidden = false;
+  });
+
+  btn.addEventListener('click', async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    await deferredPrompt.userChoice;
+    deferredPrompt = null;
+    btn.hidden = true;
+    if (divider) divider.hidden = true;
+  });
+
+  window.addEventListener('appinstalled', () => {
+    btn.hidden = true;
+    if (divider) divider.hidden = true;
+    deferredPrompt = null;
+  });
+}
+
+function shareProduct(id, name) {
+  const url = `${location.origin}${location.pathname}#/product/${id}`;
+  if (navigator.share) {
+    navigator.share({ title: name || 'Knot & Thread Tales', url }).catch(() => {});
+    return;
+  }
+  navigator.clipboard.writeText(url)
+    .then(() => showToast('🔗 Product link copied!'))
+    .catch(() => showToast(url));
+}
+
+function globalClickHandler(e) {
+  const orderBtn = e.target.closest('.product-card__order, .btn--order');
+  if (orderBtn && !orderBtn.disabled) { handleOrderClick(orderBtn.dataset.id); return; }
+
+  const shareBtn = e.target.closest('.pmodal-share');
+  if (shareBtn) { shareProduct(shareBtn.dataset.id, shareBtn.dataset.name); return; }
+
+  const quickBtn = e.target.closest('.quick-view-btn');
+  if (quickBtn) { e.stopPropagation(); openProductModal(quickBtn.dataset.id); return; }
+
+  const card = e.target.closest('.product-card');
+  if (card && !e.target.closest('button')) { openProductModal(card.dataset.id); return; }
+
+  const modal = e.target.closest('.modal');
+  if (modal && e.target === modal) { closeModal(modal.id); return; }
+
+  const navLink = e.target.closest('[data-route]');
+  if (navLink) { e.preventDefault(); Router.navigate(navLink.dataset.route); closeMobileMenu(); return; }
+}
+
+async function handleOrderClick(productId) {
+  try {
+    let p = State.currentProduct?.id == productId ? State.currentProduct : null;
+    if (!p) {
+      const d = await db.from('products').select('*').eq('id', productId).limit(1).execute();
+      p = d[0];
+    }
+    if (p) openOrderModal(p);
+  } catch { showToast('Could not load product. Try again.', 'error'); }
+}
+
+// ─── Nav ──────────────────────────────────────────────────────
+function renderNav() {
+  const nav = document.getElementById('mainNav');
+  if (!nav) return;
+  const cats = State.categories.slice(0, 6);
+  nav.querySelector('.nav-cats').innerHTML = cats.map(c =>
+    `<li><a href="#/category/${esc(c.slug)}" data-route="/category/${esc(c.slug)}" class="nav-link">${esc(c.icon || '')} ${esc(c.name)}</a></li>`
+  ).join('');
+}
+
+function initMobileMenu() {
+  const btn = document.getElementById('menuToggle');
+  const navBtn = document.getElementById('appNavMenuBtn');
+  const drawer = document.getElementById('mobileDrawer');
+  const backdrop = document.getElementById('drawerBackdrop');
+  if (!drawer) return;
+  const toggleDrawer = () => {
+    const open = drawer.classList.toggle('drawer--open');
+    btn?.setAttribute('aria-expanded', open);
+    backdrop?.classList.toggle('is-visible', open);
+    document.body.style.overflow = open ? 'hidden' : '';
+  };
+  btn?.addEventListener('click', toggleDrawer);
+  navBtn?.addEventListener('click', toggleDrawer);
+  drawer.querySelector('.drawer-close')?.addEventListener('click', closeMobileMenu);
+  backdrop?.addEventListener('click', closeMobileMenu);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && drawer.classList.contains('drawer--open')) closeMobileMenu();
+  });
+}
+
+function closeMobileMenu() {
+  document.getElementById('mobileDrawer')?.classList.remove('drawer--open');
+  document.getElementById('drawerBackdrop')?.classList.remove('is-visible');
+  document.getElementById('menuToggle')?.setAttribute('aria-expanded', 'false');
+  document.body.style.overflow = '';
+}
+
+function initScrollHeader() {
+  const h = document.getElementById('siteHeader');
+  if (!h) return;
+  window.addEventListener('scroll', () => {
+    h.classList.toggle('header--scrolled', window.scrollY > 40);
+  }, { passive: true });
+}
+
+function initSearchBar() {
+  const input = document.getElementById('searchInput');
+  if (!input) return;
+  const go = debounce((v) => { if (v.length >= 2) Router.navigate(`/search?q=${encodeURIComponent(v)}`); }, CONFIG.search.debounceMs);
+  input.addEventListener('input', e => go(e.target.value));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && input.value.length >= 1) Router.navigate(`/search?q=${encodeURIComponent(input.value)}`);
+  });
+}
+
+// ─── Page: Home ───────────────────────────────────────────────
+async function renderHome() {
+  setPage('home');
+  await Promise.all([
+    renderHero(),
+    renderFeaturedProducts(),
+    renderTrendingProducts(),
+    renderCategories(),
+    renderTestimonials(),
+    renderFAQPreview(),
+  ]);
+  initParallax();
+  initInstagramSection();
+  initCountdown();
+}
+
+// ─── Trust Stats (real numbers, not the old hardcoded "2000+ happy
+// customers / 4.9★ / 2000+ reviews" claims) ────────────────────
+async function loadTrustStats() {
+  let products = [], reviews = [], orders = [];
+  try {
+    [products, reviews, orders] = await Promise.all([
+      db.from('products').select('id').execute().catch(() => []),
+      db.from('reviews').select('rating').eq('approved', true).execute().catch(() => []),
+      db.from('orders').select('id').execute().catch(() => []),
+    ]);
+  } catch { /* leave defaults */ }
+
+  const reviewCount = reviews.length;
+  const avgRating = reviewCount ? (reviews.reduce((s, r) => s + Number(r.rating || 0), 0) / reviewCount) : null;
+
+  State.trustStats = {
+    productCount: products.length,
+    orderCount: orders.length,
+    reviewCount,
+    avgRating,
+  };
+  renderTrustStats();
+}
+
+function starString(avg) {
+  const rounded = Math.round(avg);
+  return '★'.repeat(Math.max(0, Math.min(5, rounded))) + '☆'.repeat(5 - Math.max(0, Math.min(5, rounded)));
+}
+
+function renderTrustStats() {
+  const s = State.trustStats;
+  if (!s) return;
+
+  const statOrders = document.getElementById('statOrders');
+  const statOrdersLabel = document.getElementById('statOrdersLabel');
+  if (statOrders && statOrdersLabel) {
+    if (s.orderCount > 0) { statOrders.textContent = `${s.orderCount}+`; statOrdersLabel.textContent = 'Orders Placed'; }
+    else { statOrders.textContent = 'New'; statOrdersLabel.textContent = 'Store Just Launched'; }
+  }
+  const statProducts = document.getElementById('statProducts');
+  if (statProducts) statProducts.textContent = s.productCount > 0 ? `${s.productCount}+` : 'Coming Soon';
+
+  const ratingWrap = document.getElementById('statRatingWrap');
+  const statRating = document.getElementById('statRating');
+  const statRatingLabel = document.getElementById('statRatingLabel');
+  if (ratingWrap && statRating && statRatingLabel) {
+    if (s.reviewCount > 0) {
+      ratingWrap.style.display = '';
+      statRating.textContent = `${s.avgRating.toFixed(1)}★`;
+      statRatingLabel.textContent = `Avg Rating (${s.reviewCount})`;
+    } else {
+      ratingWrap.style.display = 'none';
+    }
+  }
+
+  const heroStars = document.getElementById('heroStars');
+  if (heroStars) {
+    heroStars.innerHTML = s.reviewCount > 0
+      ? `${starString(s.avgRating)} <span>${s.avgRating.toFixed(1)} / 5</span>`
+      : '';
+    heroStars.style.display = s.reviewCount > 0 ? '' : 'none';
+  }
+
+  const revStars = document.getElementById('reviewsPageStars');
+  const revAvg = document.getElementById('reviewsPageAvg');
+  const revCount = document.getElementById('reviewsPageCount');
+  const revSummary = document.getElementById('reviewsPageSummary');
+  if (revSummary && revStars && revAvg && revCount) {
+    if (s.reviewCount > 0) {
+      revSummary.style.display = '';
+      revStars.textContent = starString(s.avgRating);
+      revAvg.textContent = `${s.avgRating.toFixed(1)} / 5`;
+      revCount.textContent = `(${s.reviewCount} review${s.reviewCount === 1 ? '' : 's'})`;
+    } else {
+      revSummary.style.display = 'none';
+    }
+  }
+
+  // About page stats — reuse the same real order count, plus the real
+  // category count (State.categories is loaded once at app init).
+  const aboutOrders = document.getElementById('aboutOrders');
+  if (aboutOrders) aboutOrders.textContent = s.orderCount > 0 ? `${s.orderCount}+` : 'New';
+  const aboutCategories = document.getElementById('aboutCategories');
+  if (aboutCategories) aboutCategories.textContent = (State.categories || []).length || '—';
+}
+
+async function renderHero() {
+  const hero = document.getElementById('hero');
+  if (!hero) return;
+  hero.innerHTML = `
+    <div class="hero__bg"><div class="hero__particles" id="heroParticles"></div></div>
+    <div class="container hero__inner">
+      <div class="hero__content">
+        <div class="hero-announce">
+          <span class="hero-announce__dot"></span>
+          <span id="buyTicker" class="ticker--in">🛍️ Loading…</span>
+        </div>
+        <span class="hero__eyebrow">✨ Handcrafted with Love</span>
+        <h1 class="hero__title">Where Every Stitch<br>Tells a <em>Story</em></h1>
+        <p class="hero__sub">Premium crochet, embroidery &amp; personalized gifts — crafted just for you, shipped pan India.</p>
+        <div class="hero__offer">
+          <span class="hero__offer-label">🔥 Today's offer ends in</span>
+          <span id="offerCountdown" class="hero__countdown"></span>
+        </div>
+        <div class="hero__actions">
+          <a href="#/products" data-route="/products" class="btn btn--primary btn--lg">Explore Collection</a>
+          <a href="#/about" data-route="/about" class="btn btn--ghost btn--lg">Our Story</a>
+        </div>
+        <div class="hero__trust">
+          <span>🎨 100% Handmade</span><span>✨ Customizable</span>
+          <span>📦 Pan India Delivery</span>
+        </div>
+      </div>
+      <div class="hero__visual" aria-hidden="true">
+        <div class="hero__visual-ring"></div>
+        <div class="hero__visual-card">
+          <div class="hero__visual-badge">🧶 New Collection ${new Date().getFullYear()}</div>
+          <div class="hero__visual-emoji">🧶<br>🎀<br>🌸</div>
+          <div class="hero__visual-stars" id="heroStars"></div>
+        </div>
+      </div>
+    </div>`;
+
+  initHeroParticles();
+  initBuyTicker();
+  initCountdown();
+  renderTrustStats();
+
+  hero.querySelectorAll('.hero__eyebrow, .hero__title, .hero__sub, .hero__offer, .hero__actions, .hero__trust').forEach((el, i) => {
+    el.style.animationDelay = `${i * 0.13}s`;
+    el.classList.add('hero-item-reveal');
+  });
+}
+
+function initHeroParticles() {
+  const c = document.getElementById('heroParticles');
+  if (!c) return;
+  const chars = ['🧵','🪡','✂️','🌸','⭐','💛','🎀','🌿','💎'];
+  const count = window.innerWidth <= 760 ? 9 : 20;
+  for (let i = 0; i < count; i++) {
+    const s = document.createElement('span');
+    s.className = 'particle';
+    s.textContent = chars[i % chars.length];
+    s.style.cssText = `left:${Math.random()*100}%;top:${Math.random()*100}%;animation-delay:${Math.random()*8}s;animation-duration:${7+Math.random()*8}s;font-size:${12+Math.random()*18}px;opacity:${0.25+Math.random()*0.4}`;
+    c.appendChild(s);
+  }
+}
+
+function initParallax() {
+  window.addEventListener('scroll', () => {
+    const bg = document.querySelector('.hero__bg');
+    if (bg) bg.style.transform = `translateY(${window.scrollY * 0.28}px)`;
+  }, { passive: true });
+}
+
+async function renderFeaturedProducts() {
+  const sec = document.getElementById('featuredProducts');
+  if (!sec) return;
+  const grid = sec.querySelector('.products-grid');
+  grid.innerHTML = skeleton(4);
+  try {
+    const featured = await db.from('featured_products').select('product_id').eq('active', true).order('sort_order').limit(8).execute();
+    const ids = featured.map(f => f.product_id);
+    if (!ids.length) { grid.innerHTML = '<p class="empty-msg">Coming soon!</p>'; return; }
+    let products = await db.from('products').select('*').in('id', ids).execute();
+    const order = new Map(ids.map((id, i) => [String(id), i]));
+    products = products.slice().sort((a, b) => (order.get(String(a.id)) ?? 0) - (order.get(String(b.id)) ?? 0));
+    await attachImages(products);
+    grid.innerHTML = products.map(productCard).join('');
+    grid.querySelectorAll('.product-card').forEach((el, i) => { el.style.animationDelay = `${i*0.07}s`; observeReveal(el); });
+    initCardMiniSliders(grid);
+  } catch { grid.innerHTML = '<p class="empty-msg">Could not load products.</p>'; }
+}
+
+async function renderTrendingProducts() {
+  const sec = document.getElementById('trendingProducts');
+  if (!sec) return;
+  const grid = sec.querySelector('.products-grid');
+  grid.innerHTML = skeleton(4);
+  try {
+    const products = await db.from('products').select('*').eq('in_stock', true).eq('is_bestseller', true)
+      .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(8).execute();
+    await attachImages(products);
+    grid.innerHTML = products.length ? products.map(productCard).join('') : '<p class="empty-msg">Coming soon!</p>';
+    grid.querySelectorAll('.product-card').forEach((el, i) => { el.style.animationDelay = `${i*0.07}s`; observeReveal(el); });
+    initCardMiniSliders(grid);
+  } catch { grid.innerHTML = ''; }
+}
+
+async function renderCategories() {
+  const sec = document.getElementById('categoriesSection');
+  if (!sec) return;
+  const grid = sec.querySelector('.categories-grid');
+  const fallback = [
+    { slug:'crochet', name:'Crochet', icon:'🧶' },
+    { slug:'embroidery', name:'Embroidery', icon:'🎨' },
+    { slug:'handmade-gifts', name:'Handmade Gifts', icon:'🎁' },
+    { slug:'personalized', name:'Personalized', icon:'✨' },
+    { slug:'pet-accessories', name:'Pet Accessories', icon:'🐾' },
+    { slug:'home-decor', name:'Home Decor', icon:'🏡' },
+    { slug:'corporate-gifts', name:'Corporate Gifts', icon:'💼' },
+    { slug:'wedding', name:'Wedding', icon:'💍' },
+  ];
+  const cats = State.categories.length ? State.categories : fallback;
+  grid.innerHTML = cats.map(c => `
+    <a href="#/category/${esc(c.slug)}" data-route="/category/${esc(c.slug)}" class="cat-card" aria-label="${esc(c.name)}">
+      <span class="cat-card__icon">${c.icon || '🎀'}</span>
+      <span class="cat-card__name">${esc(c.name)}</span>
+    </a>`).join('');
+  grid.querySelectorAll('.cat-card').forEach((el, i) => { el.style.animationDelay = `${i*0.06}s`; observeReveal(el); });
+}
+
+async function renderTestimonials() {
+  const sec = document.getElementById('testimonialsSection');
+  if (!sec) return;
+  const track = sec.querySelector('.testimonials-track');
+  if (!track) return;
+  try {
+    const items = await db.from('testimonials').select('*').eq('active', true).order('sort_order').limit(12).execute();
+    if (!items.length) { sec.style.display = 'none'; return; }
+    const cards = items.map(t => `
+      <div class="testimonial-card">
+        <div class="testimonial-stars">${'★'.repeat(Math.min(5, t.rating||5))}</div>
+        <p class="testimonial-text">"${esc(t.review || t.text || '')}"</p>
+        <div class="testimonial-author">
+          <span class="testimonial-avatar">${(t.customer_name||'C').charAt(0).toUpperCase()}</span>
+          <div>
+            <span class="testimonial-name">${esc(t.customer_name||t.name||'Customer')}</span>
+            ${t.location ? `<span class="testimonial-loc">📍 ${esc(t.location)}</span>` : ''}
+          </div>
+        </div>
+      </div>`).join('');
+    track.innerHTML = cards + cards;
+  } catch { sec.style.display = 'none'; }
+}
+
+async function renderFAQPreview() {
+  const sec = document.getElementById('faqPreview');
+  if (!sec) return;
+  const list = sec.querySelector('.faq-list');
+  try {
+    const faqs = await db.from('faqs').select('question,answer').eq('active', true).order('sort_order').limit(5).execute();
+    list.innerHTML = faqs.map((f, i) => `
+      <div class="faq-item">
+        <button class="faq-question" aria-expanded="false" aria-controls="fq${i}">
+          ${esc(f.question)} <span class="faq-icon" aria-hidden="true">+</span>
+        </button>
+        <div class="faq-answer" id="fq${i}" role="region"><p>${esc(f.answer)}</p></div>
+      </div>`).join('');
+    initFAQ(list);
+  } catch { sec.style.display = 'none'; }
+}
+
+function initFAQ(container) {
+  container.querySelectorAll('.faq-question').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const expanded = btn.getAttribute('aria-expanded') === 'true';
+      container.querySelectorAll('.faq-question').forEach(b => {
+        b.setAttribute('aria-expanded', 'false');
+        b.nextElementSibling.style.maxHeight = null;
+      });
+      if (!expanded) {
+        btn.setAttribute('aria-expanded', 'true');
+        btn.nextElementSibling.style.maxHeight = btn.nextElementSibling.scrollHeight + 'px';
+      }
+    });
+  });
+}
+
+function initInstagramSection() {
+  const sec = document.getElementById('instagramSection');
+  if (!sec) return;
+  const grid = sec.querySelector('.insta-grid');
+  if (!grid) return;
+  const emojis = ['🧶','🎀','🌸','✨','🪡','💛','🎁','🐾','🏡'];
+  grid.innerHTML = emojis.map((em, i) => `
+    <a href="${esc(CONFIG.business.instagram)}" target="_blank" rel="noopener" class="insta-item" aria-label="Instagram post ${i+1}">
+      <div class="insta-placeholder"><span>${em}</span></div>
+      <div class="insta-overlay">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+      </div>
+    </a>`).join('');
+  grid.querySelectorAll('.insta-item').forEach((el, i) => { el.style.animationDelay = `${i*0.05}s`; observeReveal(el); });
+}
+
+// ─── Page: Products ───────────────────────────────────────────
+async function renderProductsPage() {
+  setPage('products-page');
+  State.page = 0; State.filterCategory = null;
+  document.getElementById('productsHeading').textContent = 'All Products';
+  updatePfCount(); renderActiveFilterChips();
+  await loadAndRenderProducts();
+}
+
+async function renderCategoryPage(params) {
+  const slug = params.get('slug');
+  setPage('products-page');
+  State.filterCategory = slug; State.page = 0;
+  const cat = State.categories.find(c => c.slug === slug);
+  document.getElementById('productsHeading').textContent = cat ? `${cat.icon||''} ${cat.name}` : slug;
+  updatePfCount(); renderActiveFilterChips();
+  await loadAndRenderProducts();
+}
+
+async function loadAndRenderProducts() {
+  const grid = document.getElementById('productsGrid');
+  if (!grid) return;
+  grid.innerHTML = skeleton(CONFIG.pagination.productsPerPage);
+  try {
+    const q = db.from('products').select('*');
+    if (State.filterCategory) {
+      const cat = State.categories.find(c => c.slug === State.filterCategory);
+      if (cat) q.eq('category_id', cat.id);
+    }
+    if (State.filterPriceMin !== null) q.gte('price', State.filterPriceMin);
+    if (State.filterPriceMax !== null) q.lte('price', State.filterPriceMax);
+    if (State.filterInStock) q.eq('in_stock', true);
+    if (State.filterBestseller) q.eq('is_bestseller', true);
+    if (State.filterCustomizable) q.eq('is_customizable', true);
+    const offset = State.page * CONFIG.pagination.productsPerPage;
+    q.order(State.sortBy, { ascending: State.sortAsc }).order('id', { ascending: State.sortAsc }).range(offset, offset + CONFIG.pagination.productsPerPage - 1);
+    const products = await q.execute();
+    await attachImages(products);
+    grid.innerHTML = products.length ? products.map(productCard).join('') : '<p class="empty-msg">No products found.</p>';
+    grid.querySelectorAll('.product-card').forEach((el, i) => { el.style.animationDelay = `${i*0.05}s`; observeReveal(el); });
+    initCardMiniSliders(grid);
+    renderPagination(products.length);
+    const rc = document.getElementById('pfResultCount');
+    if (rc) rc.textContent = products.length ? `${products.length} item${products.length!==1?'s':''}` : '';
+  } catch { grid.innerHTML = '<p class="empty-msg">Could not load products.</p>'; }
+}
+
+function renderPagination(count) {
+  const p = document.getElementById('pagination');
+  if (!p) return;
+  p.innerHTML = `
+    <button class="btn btn--ghost" onclick="changePage(-1)" ${State.page===0?'disabled':''}>← Prev</button>
+    <span class="page-num">Page ${State.page+1}</span>
+    <button class="btn btn--ghost" onclick="changePage(1)" ${count<CONFIG.pagination.productsPerPage?'disabled':''}>Next →</button>`;
+}
+
+window.changePage = (d) => {
+  State.page = Math.max(0, State.page + d);
+  loadAndRenderProducts();
+  document.getElementById('productsGrid')?.scrollIntoView({ behavior:'smooth', block:'start' });
+};
+
+// ─── Product Detail Modal ─────────────────────────────────────
+async function openProductModal(id) {
+  const modal = document.getElementById('productModal');
+  if (!modal) return;
+  openModal('productModal');
+  modal.querySelector('.product-modal-body').innerHTML = `<div style="min-height:300px;display:flex;align-items:center;justify-content:center;">${skeleton(1,'skeleton-detail')}</div>`;
+
+  try {
+    const [productArr, imagesArr, reviewsArr] = await Promise.all([
+      db.from('products').select('*').eq('id', id).limit(1).execute(),
+      fetchProductImages(id),
+      db.from('reviews').select('*').eq('product_id', id).eq('approved', true).order('created_at', { ascending:false }).order('id', { ascending:false }).limit(5).execute().catch(() => []),
+    ]);
+
+    const p = productArr[0];
+    if (!p) { modal.querySelector('.product-modal-body').innerHTML = '<p class="empty-msg">Product not found.</p>'; return; }
+    State.currentProduct = p;
+
+    const allImages = imagesArr.length ? imagesArr : [];
+    const hasOffer = p.offer_price && Number(p.offer_price) < Number(p.price);
+    const discount = hasOffer ? Math.round((1 - p.offer_price / p.price) * 100) : 0;
+
+    modal.querySelector('.product-modal-body').innerHTML = `
+      <div class="pmodal-grid">
+        <div class="pmodal-gallery"></div>
+        <div class="pmodal-info">
+          <span class="pmodal-code">${esc(p.product_code||'KTT-'+p.id)}</span>
+          <h2 class="pmodal-name">${esc(p.name)}</h2>
+          <div class="pmodal-badges">
+            <span class="badge badge--handmade">Handmade</span>
+            ${p.is_bestseller ? '<span class="badge badge--bestseller">⭐ Bestseller</span>' : ''}
+            ${p.is_customizable ? '<span class="badge badge--custom">✏️ Customizable</span>' : ''}
+          </div>
+          <div class="pmodal-pricing">
+            <span class="pmodal-price">${formatPrice(p.offer_price||p.price)}</span>
+            ${hasOffer ? `<span class="pmodal-orig">${formatPrice(p.price)}</span><span class="badge badge--off">−${discount}%</span>` : ''}
+          </div>
+          ${!p.in_stock
+            ? '<div class="pmodal-oos">⚠️ Currently Out of Stock</div>'
+            : '<div class="pmodal-stock">✅ In Stock — Ready to Ship</div>'}
+          <div class="pmodal-desc">${p.description ? esc(p.description).replace(/\n/g,'<br>') : ''}</div>
+          <div class="pmodal-meta">
+            ${p.dimensions  ? `<div class="pmodal-meta-item"><span>📐 Dimensions</span><span>${esc(p.dimensions)}</span></div>` : ''}
+            ${p.materials   ? `<div class="pmodal-meta-item"><span>🧵 Materials</span><span>${esc(p.materials)}</span></div>` : ''}
+            ${p.colors      ? `<div class="pmodal-meta-item"><span>🎨 Colors</span><span>${esc(p.colors)}</span></div>` : ''}
+            ${p.wash_care   ? `<div class="pmodal-meta-item"><span>🧺 Care</span><span>${esc(p.wash_care)}</span></div>` : ''}
+            <div class="pmodal-meta-item"><span>📦 Delivery</span><span>${esc(p.delivery_days||CONFIG.business.deliveryDays)}</span></div>
+          </div>
+          <button class="btn btn--primary btn--lg btn--order w-full" data-id="${p.id}" ${!p.in_stock?'disabled':''}>
+            💬 ${p.in_stock ? 'Order via WhatsApp' : 'Out of Stock'}
+          </button>
+          <button class="btn btn--outline btn--lg pmodal-share w-full" data-id="${p.id}" data-name="${esc(p.name)}" style="margin-top:8px;">
+            🔗 Share this product
+          </button>
+          <p class="pmodal-assurance">🔒 Safe & Secure · ✂️ Handcrafted · 🎀 Gift-ready packaging</p>
+        </div>
+      </div>
+      <div class="pmodal-reviews">
+        <h3>Customer Reviews</h3>
+        <div class="reviews-list">
+          ${reviewsArr.length ? reviewsArr.map(r => `
+            <div class="review-item">
+              <div class="review-header">
+                <span class="review-author">${esc(r.customer_name||'Customer')}</span>
+                <span class="review-stars">${'★'.repeat(Math.min(5,r.rating||5))}</span>
+              </div>
+              <p class="review-text">${esc(r.review_text||r.text||'')}</p>
+            </div>`).join('') : '<p class="empty-msg">No reviews yet. Be the first!</p>'}
+        </div>
+
+        <form id="reviewForm" class="review-form" data-product-id="${p.id}">
+          <h4>Share Your Experience</h4>
+          <p class="review-form__subtitle">Your feedback helps other shoppers decide.</p>
+
+          <div class="review-form__field">
+            <label class="review-form__label">Your Rating</label>
+            <div class="star-rating" role="radiogroup" aria-label="Star rating">
+              ${[1,2,3,4,5].map(v => `<button type="button" class="star-rating__star" data-value="${v}" aria-label="${v} Star${v>1?'s':''}">★</button>`).join('')}
+              <span class="star-rating__label"></span>
+            </div>
+            <input type="hidden" name="reviewerRating" value="5" required>
+          </div>
+
+          <div class="review-form__field">
+            <label class="review-form__label" for="reviewerName_${p.id}">Your Name</label>
+            <input type="text" id="reviewerName_${p.id}" name="reviewerName" placeholder="e.g. Priya S." required maxlength="80">
+          </div>
+
+          <div class="review-form__field">
+            <label class="review-form__label" for="reviewerText_${p.id}">Your Review</label>
+            <textarea id="reviewerText_${p.id}" name="reviewerText" placeholder="How was the quality, fit, or packaging? What did you love about it?" required maxlength="1000" rows="4"></textarea>
+          </div>
+
+          <button type="submit" class="btn btn--primary btn--sm review-form__submit">✍️ Submit Review</button>
+          <p class="review-form__note">🔒 Reviews are checked before they appear publicly.</p>
+        </form>
+      </div>`;
+
+    buildGallery(allImages.map(i => i.image_url || i), modal.querySelector('.pmodal-gallery'));
+
+    const reviewForm = modal.querySelector('#reviewForm');
+    if (reviewForm) {
+      const stars = reviewForm.querySelectorAll('.star-rating__star');
+      const ratingInput = reviewForm.querySelector('input[name="reviewerRating"]');
+      const ratingLabel = reviewForm.querySelector('.star-rating__label');
+      const labels = { 1:'Poor', 2:'Fair', 3:'Good', 4:'Very Good', 5:'Excellent' };
+    
+      const paint = (val) => {
+        stars.forEach(btn => btn.classList.toggle('is-active', Number(btn.dataset.value) <= val));
+      };
+      const setRating = (val) => {
+        ratingInput.value = val;
+        paint(val);
+        if (ratingLabel) ratingLabel.textContent = labels[val] || '';
+      };
+    
+      stars.forEach(btn => {
+        btn.addEventListener('click', () => setRating(Number(btn.dataset.value)));
+        btn.addEventListener('mouseenter', () => {
+          const hoverVal = Number(btn.dataset.value);
+          stars.forEach(s => s.classList.toggle('is-hover', Number(s.dataset.value) <= hoverVal));
+        });
+        btn.addEventListener('mouseleave', () => {
+          stars.forEach(s => s.classList.remove('is-hover'));
+        });
+      });
+    
+      setRating(5); // sensible default
+      reviewForm.addEventListener('submit', submitReview);
+    }
+  } catch { modal.querySelector('.product-modal-body').innerHTML = '<p class="empty-msg">Could not load product details.</p>'; }
+}
+
+async function submitReview(e) {
+  e.preventDefault();
+  const form = e.target;
+  const productId = form.dataset.productId;
+  const name = form.reviewerName.value.trim();
+  const rating = Number(form.reviewerRating.value);
+  const text = form.reviewerText.value.trim();
+  if (!name || !text || !rating) return;
+
+  const btn = form.querySelector('button[type="submit"]');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  try {
+    await db.from('reviews').insert({
+      product_id: Number(productId),
+      customer_name: name,
+      rating,
+      review_text: text,
+      approved: false,
+    });
+    form.innerHTML = '<p class="empty-msg">Thanks! Your review was submitted and will appear once approved. 🙏</p>';
+    showToast('Review submitted for approval ✅');
+  } catch (err) {
+    console.error('Review submit failed:', err);
+    btn.disabled = false; btn.textContent = '✍️ Submit Review';
+    showToast('Could not submit review. Please try again.', 'error');
+  }
+}
+
+// ─── Page: Search ─────────────────────────────────────────────
+async function renderSearchPage(params) {
+  setPage('search-page');
+  const q = params.get('q') || '';
+  State.searchQuery = q; State.page = 0;
+  const h = document.getElementById('searchHeading');
+  if (h) h.textContent = q ? `Results for "${q}"` : 'Search Products';
+  const inp = document.getElementById('searchPageInput');
+  if (inp) inp.value = q;
+  updatePfCount(); renderActiveFilterChips();
+  if (q) await searchProducts();
+}
+
+async function searchProducts() {
+  const grid = document.getElementById('searchGrid');
+  if (!grid) return;
+  grid.innerHTML = skeleton(8);
+  try {
+    const term = State.searchQuery.replace(/[,()]/g, ' ').trim();
+    const q = db.from('products').select('*')
+      .or(`name.ilike.%${term}%,product_code.ilike.%${term}%,description.ilike.%${term}%`);
+    if (State.filterCategory) {
+      const cat = State.categories.find(c => c.slug === State.filterCategory);
+      if (cat) q.eq('category_id', cat.id);
+    }
+    if (State.filterPriceMin !== null) q.gte('price', State.filterPriceMin);
+    if (State.filterPriceMax !== null) q.lte('price', State.filterPriceMax);
+    if (State.filterInStock) q.eq('in_stock', true);
+    if (State.filterBestseller) q.eq('is_bestseller', true);
+    if (State.filterCustomizable) q.eq('is_customizable', true);
+    q.order(State.sortBy, { ascending: State.sortAsc }).order('id', { ascending: State.sortAsc }).limit(CONFIG.pagination.productsPerPage);
+    const results = await q.execute();
+    await attachImages(results);
+    grid.innerHTML = results.length
+      ? results.map(productCard).join('')
+      : `<p class="empty-msg">No products found for "<strong>${esc(State.searchQuery)}</strong>".<br>Try a different keyword.</p>`;
+    const h = document.getElementById('searchHeading');
+    if (h) h.textContent = `${results.length} result${results.length!==1?'s':''} for "${State.searchQuery}"`;
+    const rc = document.getElementById('pfResultCountSearch');
+    if (rc) rc.textContent = results.length ? `${results.length} item${results.length!==1?'s':''}` : '';
+    grid.querySelectorAll('.product-card').forEach(el => observeReveal(el));
+    initCardMiniSliders(grid);
+  } catch { grid.innerHTML = '<p class="empty-msg">Search failed. Please try again.</p>'; }
+}
+
+// ─── Page: About ──────────────────────────────────────────────
+function renderAboutPage() {
+  setPage('about-page');
+  const imgBox = document.querySelector('.about-story-img');
+  if (imgBox && CONFIG.site?.aboutImage && !imgBox.querySelector('img')) {
+    imgBox.innerHTML = `<img src="${CONFIG.site.aboutImage}" alt="Knot & Thread Tales — our workspace" loading="lazy" style="width:100%;height:100%;object-fit:cover;">`;
+  }
+}
+
+// ─── Page: FAQ ────────────────────────────────────────────────
+async function renderFaqPage() {
+  setPage('faq-page');
+  const list = document.getElementById('fullFaqList');
+  if (!list) return;
+  list.innerHTML = skeleton(6, 'skeleton-faq');
+  try {
+    const faqs = await db.from('faqs').select('question,answer').eq('active', true).order('sort_order').execute();
+    list.innerHTML = faqs.map((f, i) => `
+      <div class="faq-item">
+        <button class="faq-question" aria-expanded="false" aria-controls="ffq${i}">
+          ${esc(f.question)} <span class="faq-icon" aria-hidden="true">+</span>
+        </button>
+        <div class="faq-answer" id="ffq${i}" role="region"><p>${esc(f.answer)}</p></div>
+      </div>`).join('');
+    initFAQ(list);
+  } catch { list.innerHTML = '<p class="empty-msg">Could not load FAQs.</p>'; }
+}
+
+// ─── Page: Contact ────────────────────────────────────────────
+function renderContactPage() { setPage('contact-page'); }
+
+// ─── Page: Reviews ────────────────────────────────────────────
+async function renderReviewsPage() {
+  setPage('reviews-page');
+  const grid = document.getElementById('reviewsGrid');
+  if (!grid) return;
+  grid.innerHTML = skeleton(8);
+  try {
+    const reviews = await db.from('reviews').select('*').eq('approved', true).order('created_at', { ascending:false }).order('id', { ascending:false }).limit(CONFIG.pagination.reviewsPerPage).execute();
+    grid.innerHTML = reviews.length ? reviews.map(r => `
+      <div class="review-card">
+        <div class="review-header">
+          <div class="review-avatar">${(r.customer_name||'C').charAt(0).toUpperCase()}</div>
+          <div>
+            <p class="review-author">${esc(r.customer_name||'Customer')}</p>
+            <p class="review-stars">${'★'.repeat(Math.min(5,r.rating||5))}${'☆'.repeat(5-Math.min(5,r.rating||5))}</p>
+          </div>
+        </div>
+        <p class="review-text">"${esc(r.review_text||r.text||'')}"</p>
+        ${r.product_name ? `<p class="review-product">Product: ${esc(r.product_name)}</p>` : ''}
+      </div>`).join('') : '<p class="empty-msg">No reviews yet. Be the first!</p>';
+    grid.querySelectorAll('.review-card').forEach(el => observeReveal(el));
+  } catch { grid.innerHTML = '<p class="empty-msg">Could not load reviews.</p>'; }
+}
+
+// ─── Page: Legal ──────────────────────────────────────────────
+function renderPrivacyPage() { setPage('privacy-page'); }
+function renderTermsPage()   { setPage('terms-page'); }
+
+// ─── Page Switcher ────────────────────────────────────────────
+function setPage(id) {
+  $$('.page').forEach(p => { p.hidden = true; p.setAttribute('aria-hidden','true'); });
+  const page = document.getElementById(id);
+  if (page) {
+    page.hidden = false;
+    page.setAttribute('aria-hidden','false');
+    page.querySelectorAll('.will-reveal').forEach(el => revealObserver.observe(el));
+  }
+  window.scrollTo({ top:0, behavior:'smooth' });
+  updateActiveNav();
+}
+
+function updateActiveNav() {
+  const cur = Router.current();
+  $$('.nav-link,.drawer-link,.app-nav-item[data-route]').forEach(a => {
+    const r = a.dataset.route || a.getAttribute('href')?.slice(1);
+    a.classList.toggle('active', r === cur);
+  });
+}
+
+// ─── Form Handlers ────────────────────────────────────────────
+function handleContactForm(e) {
+  e.preventDefault();
+  const f = e.target;
+  const msg = encodeURIComponent(
+`Hello Knot & Thread Tales! 👋
+
+Name: ${f.contactName?.value.trim()}
+Email: ${f.contactEmail?.value.trim()}
+Subject: ${f.contactSubject?.value.trim()||'Enquiry'}
+
+Message:
+${f.contactMessage?.value.trim()}`
+  );
+  window.open(`https://wa.me/${CONFIG.whatsapp.number}?text=${msg}`, '_blank');
+  showToast('Redirecting to WhatsApp 💬');
+  f.reset();
+}
+
+// ─── Sort / Filter ────────────────────────────────────────────
+function reloadCurrentPage() {
+  Router.current() === '/search' ? searchProducts() : loadAndRenderProducts();
+}
+
+// A category filter is embedded in the URL itself (/category/:slug). If we
+// change or clear State.filterCategory while sitting on a category route (or
+// /products) without also updating the hash, the URL and State fall out of
+// sync — a refresh (or back/forward) re-derives State from the stale URL and
+// silently restores the old category. Route through the hash whenever the
+// resulting page would need a different URL; only fall back to an in-place
+// reload when the current route already matches the desired one.
+function commitFilterChange() {
+  const cur = Router.current();
+  if (cur === '/products' || cur.startsWith('/category/')) {
+    const desired = State.filterCategory ? `/category/${State.filterCategory}` : '/products';
+    if (cur !== desired) { Router.navigate(desired); return; }
+  }
+  reloadCurrentPage();
+}
+
+window.applySort = (val) => {
+  const [col, dir] = val.split(':');
+  State.sortBy = col; State.sortAsc = dir === 'asc'; State.page = 0;
+  reloadCurrentPage();
+};
+
+function renderCategoryChips() {
+  const wrap = document.getElementById('pfCategoryChips');
+  if (!wrap) return;
+  const cats = State.categories || [];
+  wrap.innerHTML = [`<button type="button" class="pf-chip${!State.filterCategory ? ' active' : ''}" data-slug="">All</button>`]
+    .concat(cats.map(c => `<button type="button" class="pf-chip${State.filterCategory === c.slug ? ' active' : ''}" data-slug="${esc(c.slug)}">${esc(c.icon || '')} ${esc(c.name)}</button>`))
+    .join('');
+  wrap.querySelectorAll('.pf-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      wrap.querySelectorAll('.pf-chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      State.filterCategory = chip.dataset.slug || null;
+    });
+  });
+}
+
+function syncFilterSheetFromState() {
+  const min = document.getElementById('pfPriceMin');
+  const max = document.getElementById('pfPriceMax');
+  if (min) min.value = State.filterPriceMin ?? '';
+  if (max) max.value = State.filterPriceMax ?? '';
+  document.querySelectorAll('#pfPriceChips .pf-chip').forEach(c => {
+    const hasRange = State.filterPriceMin !== null || State.filterPriceMax !== null;
+    const matches = String(State.filterPriceMin ?? '') === (c.dataset.min || '') && String(State.filterPriceMax ?? '') === (c.dataset.max || '');
+    c.classList.toggle('active', hasRange && matches);
+  });
+  const inStock = document.getElementById('pfInStock');
+  if (inStock) inStock.checked = !!State.filterInStock;
+  document.getElementById('pfChipBestseller')?.classList.toggle('active', !!State.filterBestseller);
+  document.getElementById('pfChipCustom')?.classList.toggle('active', !!State.filterCustomizable);
+}
+
+function updatePfCount() {
+  let n = 0;
+  if (State.filterCategory) n++;
+  if (State.filterPriceMin !== null || State.filterPriceMax !== null) n++;
+  if (State.filterInStock) n++;
+  if (State.filterBestseller) n++;
+  if (State.filterCustomizable) n++;
+  [document.getElementById('pfCount'), document.getElementById('pfCountSearch')].forEach(el => {
+    if (!el) return;
+    if (n > 0) { el.textContent = n; el.hidden = false; } else { el.hidden = true; }
+  });
+  [document.getElementById('pfOpenBtn'), document.getElementById('pfOpenBtnSearch')].forEach(el => el?.classList.toggle('is-active', n > 0));
+}
+
+function renderActiveFilterChips() {
+  const wrap = document.getElementById('pfActiveChips');
+  if (!wrap) return;
+  const chips = [];
+  if (State.filterCategory) {
+    const cat = State.categories.find(c => c.slug === State.filterCategory);
+    chips.push({ key: 'category', label: cat ? cat.name : State.filterCategory });
+  }
+  if (State.filterPriceMin !== null || State.filterPriceMax !== null) {
+    chips.push({ key: 'price', label: `₹${State.filterPriceMin ?? 0}${State.filterPriceMax !== null ? ' – ₹' + State.filterPriceMax : '+'}` });
+  }
+  if (State.filterInStock) chips.push({ key: 'stock', label: 'In Stock' });
+  if (State.filterBestseller) chips.push({ key: 'bestseller', label: '⭐ Bestseller' });
+  if (State.filterCustomizable) chips.push({ key: 'custom', label: '✏️ Customizable' });
+
+  if (!chips.length) { wrap.hidden = true; wrap.innerHTML = ''; return; }
+  wrap.hidden = false;
+  wrap.innerHTML = chips.map(c => `<span class="pf-activechip" data-key="${c.key}">${esc(c.label)}<button type="button" aria-label="Remove filter">&times;</button></span>`).join('');
+  wrap.querySelectorAll('.pf-activechip button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.parentElement.dataset.key;
+      if (key === 'category') State.filterCategory = null;
+      if (key === 'price') { State.filterPriceMin = null; State.filterPriceMax = null; }
+      if (key === 'stock') State.filterInStock = false;
+      if (key === 'bestseller') State.filterBestseller = false;
+      if (key === 'custom') State.filterCustomizable = false;
+      State.page = 0;
+      updatePfCount(); renderActiveFilterChips(); commitFilterChange();
+    });
+  });
+}
+
+function initProductFilters() {
+  const backdrop = document.getElementById('pfBackdrop');
+  const sheet = document.getElementById('pfSheet');
+  if (!sheet) return;
+  const openBtns = [document.getElementById('pfOpenBtn'), document.getElementById('pfOpenBtnSearch')].filter(Boolean);
+  const closeBtn = document.getElementById('pfCloseBtn');
+  const applyBtn = document.getElementById('pfApplyBtn');
+  const clearBtn = document.getElementById('pfClearBtn');
+  const priceMinInput = document.getElementById('pfPriceMin');
+  const priceMaxInput = document.getElementById('pfPriceMax');
+  const inStockInput = document.getElementById('pfInStock');
+  const chipBestseller = document.getElementById('pfChipBestseller');
+  const chipCustom = document.getElementById('pfChipCustom');
+
+  function openSheet() {
+    renderCategoryChips();
+    syncFilterSheetFromState();
+    backdrop.classList.add('is-open');
+    sheet.classList.add('is-open');
+    sheet.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeSheet() {
+    backdrop.classList.remove('is-open');
+    sheet.classList.remove('is-open');
+    sheet.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+  }
+  openBtns.forEach(b => b.addEventListener('click', openSheet));
+  closeBtn?.addEventListener('click', closeSheet);
+  backdrop?.addEventListener('click', closeSheet);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && sheet.classList.contains('is-open')) closeSheet(); });
+
+  document.getElementById('pfPriceChips')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.pf-chip');
+    if (!chip) return;
+    const wasActive = chip.classList.contains('active');
+    document.querySelectorAll('#pfPriceChips .pf-chip').forEach(c => c.classList.remove('active'));
+    if (!wasActive) {
+      chip.classList.add('active');
+      priceMinInput.value = chip.dataset.min || '';
+      priceMaxInput.value = chip.dataset.max || '';
+    } else {
+      priceMinInput.value = ''; priceMaxInput.value = '';
+    }
+  });
+  [priceMinInput, priceMaxInput].forEach(inp => inp?.addEventListener('input', () => {
+    document.querySelectorAll('#pfPriceChips .pf-chip').forEach(c => c.classList.remove('active'));
+  }));
+
+  chipBestseller?.addEventListener('click', () => chipBestseller.classList.toggle('active'));
+  chipCustom?.addEventListener('click', () => chipCustom.classList.toggle('active'));
+
+  applyBtn?.addEventListener('click', () => {
+    State.filterPriceMin = priceMinInput.value ? Number(priceMinInput.value) : null;
+    State.filterPriceMax = priceMaxInput.value ? Number(priceMaxInput.value) : null;
+    State.filterInStock = !!inStockInput?.checked;
+    State.filterBestseller = chipBestseller?.classList.contains('active') || false;
+    State.filterCustomizable = chipCustom?.classList.contains('active') || false;
+    State.page = 0;
+    closeSheet();
+    updatePfCount();
+    renderActiveFilterChips();
+    commitFilterChange();
+  });
+
+  clearBtn?.addEventListener('click', () => {
+    State.filterCategory = null; State.filterPriceMin = null; State.filterPriceMax = null;
+    State.filterInStock = false; State.filterBestseller = false; State.filterCustomizable = false;
+    State.page = 0;
+    renderCategoryChips();
+    syncFilterSheetFromState();
+    updatePfCount();
+    renderActiveFilterChips();
+    commitFilterChange();
+  });
+}
+
+window.searchPageSearch = () => {
+  const q = document.getElementById('searchPageInput')?.value.trim();
+  if (q) {
+    State.searchQuery = q;
+    const h = document.getElementById('searchHeading');
+    if (h) h.textContent = `Searching for "${q}"…`;
+    searchProducts();
+  }
+};
+
+// ─── Expose Globals ───────────────────────────────────────────
+window.openProductModal    = openProductModal;
+window.openOrderModal      = openOrderModal;
+window.closeModal          = closeModal;
+window.submitOrder         = submitOrder;
+window.openPaymentModal    = openPaymentModal;
+window.copyUPI             = copyUPI;
+window.confirmPayment      = confirmPayment;
+window.downloadQR          = downloadQR;
+window.shareQR             = shareQR;
+window.handleContactForm   = handleContactForm;
+
+// ─── Boot ─────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', initApp);
